@@ -1,4 +1,4 @@
-name: tome-wishlist-downloader
+name: wishflow
 services:
   tome-wishlist-downloader:
     build:
