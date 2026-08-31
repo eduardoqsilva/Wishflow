@@ -356,23 +356,29 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 }
 
 // searchAttempt executa a busca correspondente a tentativa informada, variando query/idioma.
+// A estrategia prioriza o idioma principal (primeiro do .env) nas duas primeiras tentativas
+// para maximizar as chances de encontrar edicoes no idioma desejado. A API do zlib retorna
+// majoritariamente ingles quando ambos os idiomas sao passados juntos, entao separamos.
 func searchAttempt(zc *zlib.Client, w tome.Wish, author string, mainLang string, attempt int) ([]zlib.Book, error) {
 	switch attempt {
 	case 1:
-		// Original: titulo + autor, idiomas do .env.
+		// Titulo + autor, SO idioma principal: a API retorna mais resultados no idioma
+		// desejado quando so ele e filtrado, em vez de misturar com english.
 		q := strings.TrimSpace(w.Title + " " + author)
-		log.Printf("wish #%d: busca %d/3 \"%s\" (idiomas do .env)", w.ID, attempt, q)
-		return zc.Search(q)
+		langs := mainLangList(mainLang)
+		log.Printf("wish #%d: busca %d/3 \"%s\" (idioma=%v)", w.ID, attempt, q, langs)
+		return zc.SearchLanguages(q, langs)
 	case 2:
-		// Busca SO PELO TITULO + idioma principal: espelha a busca manual que costuma
-		// achar a edicao correta mesmo quando o autor-combinado a esconde. O filtro por
+		// SO titulo + idioma principal: espelha a busca manual que costuma achar a
+		// edicao correta mesmo quando o autor-combinado a esconde. O filtro por
 		// estrategia (filterByStrategy) ainda exige autor correspondente + titulo forte.
 		q := strings.TrimSpace(w.Title)
-		log.Printf("wish #%d: busca %d/3 apenas p/ titulo \"%s\" (idioma principal=%s)", w.ID, attempt, q, mainLang)
-		return zc.SearchLanguages(q, mainLangList(mainLang))
+		langs := mainLangList(mainLang)
+		log.Printf("wish #%d: busca %d/3 apenas p/ titulo \"%s\" (idioma=%v)", w.ID, attempt, q, langs)
+		return zc.SearchLanguages(q, langs)
 	case 3:
-		// Foca titulo original + autor, ignorando idioma (pode haver versao pt com
-		// idioma incorreto no registro).
+		// Fallback: titulo + autor, todos os idiomas (pode haver versao pt com
+		// idioma incorreto no registro ou edicao em outro idioma).
 		q := strings.TrimSpace(w.Title + " " + author)
 		log.Printf("wish #%d: busca %d/3 \"%s\" (todos os idiomas)", w.ID, attempt, q)
 		return zc.SearchLanguages(q, nil)
