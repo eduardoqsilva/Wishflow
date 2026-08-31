@@ -28,6 +28,12 @@ type Config struct {
 	FormatPreference   []string
 	DownloadDir        string
 	MaxDownloadsPerRun int
+
+	ScheduleDB          string
+	ScheduleBaseInterval time.Duration
+	ScheduleMaxInterval time.Duration
+	ScheduleJitter      time.Duration
+	ScheduleCascadeN    int
 }
 
 func Load(path string) (*Config, error) {
@@ -53,6 +59,12 @@ func Load(path string) (*Config, error) {
 	cfg.PollInterval = seconds(getEnv("TOME_POLL_INTERVAL", "60"))
 	cfg.UploadRetryInterval = seconds(getEnv("TOME_UPLOAD_RETRY_INTERVAL", "60"))
 	cfg.UploadMaxRetries = atoiDefault(getEnv("TOME_UPLOAD_MAX_RETRIES", "3"), 3)
+
+	cfg.ScheduleDB = getEnv("SCHEDULE_DB", "./schedule.db")
+	cfg.ScheduleBaseInterval = dfltDuration(getEnv("SCHEDULE_BASE_INTERVAL", "24h"), 24*time.Hour)
+	cfg.ScheduleMaxInterval = dfltDuration(getEnv("SCHEDULE_MAX_INTERVAL", "192h"), 192*time.Hour) // 192h = 8 dias
+	cfg.ScheduleJitter = dfltDuration(getEnv("SCHEDULE_JITTER", "2h"), 2*time.Hour)
+	cfg.ScheduleCascadeN = atoiDefault(getEnv("SCHEDULE_CASCADE_N", "2"), 2)
 
 	if cfg.TomeURL == "" || cfg.TomeAPIToken == "" {
 		return nil, fmt.Errorf("TOME_URL e TOME_API_TOKEN sao obrigatorios (defina no .env)")
@@ -123,4 +135,12 @@ func atoiDefault(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+func dfltDuration(s string, def time.Duration) time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(s))
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
 }

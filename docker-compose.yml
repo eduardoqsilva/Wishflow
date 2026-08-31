@@ -9,6 +9,8 @@ services:
       - .env
     environment:
       - ZLIB_DOWNLOAD_DIR=/downloads
+      - SCHEDULE_DB=/data/schedule.db
     volumes:
       - ./downloads:/downloads
+      - ./data:/data
     restart: unless-stopped

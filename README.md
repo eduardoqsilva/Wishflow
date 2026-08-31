@@ -31,7 +31,30 @@ Tome e **marca a wish como `fulfilled`**, fechando o ciclo por completo.
    wishlist: se a wish sumiu, foi fechada; se continua aberta, marca como
    **dismissed** (recusada) via `POST /api/admin/wishlist/{id}/dismiss` — evitando
    ciclo infinito.
-8. Repete a cada `POLL_INTERVAL`.
+8. **Sem match/link**: se após as **3 tentativas variadas** nenhum candidato tiver
+   link de download, a wish é **agendada em SQLite** (monitoramento) e fica fora do
+   fluxo normal até o próximo prazo, com **backoff exponencial** (24h → 2d → 4d → 8d).
+   Se um dia o livro ficar disponível, é baixado; senão, re-checada com intervalo maior.
+9. Repete a cada `POLL_INTERVAL`.
+
+### Monitoramento de longo prazo
+
+Quando uma wish não tem link de download (ex. o registro no Z-Library existe mas o
+arquivo está indisponível), o Wishflow não fica re-tentando a mesma coisa a cada ciclo.
+Em vez disso:
+
+- Realiza até **3 tentativas variadas de busca** (cada uma ajustando levemente a query
+  e o filtro — sem relaxar o critério de match, para nunca pegar um livro errado):
+  1. **título + autor**, idiomas do `.env`;
+  2. **foca no autor + idioma principal** (flexibiliza o título);
+  3. **título + autor**, **ignorando idioma** (pode haver versão com idioma incorreto).
+- Se nenhum candidato tiver link, **agenda a wish** num banco **SQLite**
+  (`SCHEDULE_DB`), com **backoff exponencial** (base `24h`, dobrando até o teto `8d`).
+- A wish agendada é **ignorada** nos ciclos de polling até vencer o prazo.
+- Ao vencer, é re-testada; se ainda não tiver link, **re-agendada** com o próximo
+  intervalo maior.
+- **Reconciliação**: se a wish **sumir** do Tome ou mudar de status (`fulfilled`/
+  `dismissed`), o agendamento é **apagado** do banco e do cache em memória.
 
 ### Resiliência contra bot checks (DiamWall/Cloudflare)
 
@@ -145,6 +168,16 @@ ficam persistidos na máquina host durante a execução.
 | `ZLIB_DOWNLOAD_DIR` | não | `./downloads` | Diretório temporário dos downloads |
 | `ZLIB_MAX_DOWNLOADS_PER_RUN` | não | `1` | Quantos livros baixar por ciclo |
 
+### Monitoramento (schedule)
+
+| Variável | Obrigatório | Padrão | Descrição |
+|----------|-------------|--------|-----------|
+| `SCHEDULE_DB` | não | `./schedule.db` | Caminho do banco SQLite de monitoramento |
+| `SCHEDULE_BASE_INTERVAL` | não | `24h` | Intervalo inicial entre tentativas |
+| `SCHEDULE_MAX_INTERVAL` | não | `192h` | Teto do backoff (192h = 8 dias) |
+| `SCHEDULE_JITTER` | não | `2h` | Jitter aleatório adicionado ao prazo |
+| `SCHEDULE_CASCADE_N` | não | `2` | Candidatos testados por tentativa até achar um com link |
+
 \* Se `ZLIB_EMAIL`/`ZLIB_PASSWORD` estiverem **vazios**, o programa roda em **modo
 so-listagem**: apenas lista as wishes do Tome, sem buscar baixar nada.
 
@@ -178,9 +211,10 @@ wishflow/
 ├── main.go                    # Orquestração do fluxo e ciclo de polling
 ├── internal/
 │   ├── config/config.go       # Leitura do .env
-│   ├── tome/tome.go           # Cliente da API do Tome (wishlist, upload, fulfill)
+│   ├── schedule/schedule.go   # Monitoramento SQLite (cache em memoria + backoff)
+│   ├── tome/tome.go           # Cliente da API do Tome (wishlist, upload, fulfill, dismiss)
 │   └── zlib/
-│       ├── zlib.go            # Cliente da API do Z-Library (login, busca, download)
+│       ├── zlib.go            # Cliente da API do Z-Library (login, busca, download, match)
 │       └── mirrors.go         # Descoberta de mirrors e detecção de bot check
 ├── .env.example               # Modelo de configuração
 └── Dockerfile / docker-compose.yml

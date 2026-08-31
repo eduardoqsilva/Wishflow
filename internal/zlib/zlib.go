@@ -18,6 +18,12 @@ import (
 
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"
 
+// ErrNoDownload indica que um livro especifico nao possui link de download disponivel
+// (resposta sem downloadLink ou success falso). Diferente de erros transitorios (rede,
+// bot check, quota), este e permanente para aquele registro: tentar outro candidato ou
+// agendar a wish, em vez de reprocessar o mesmo livro infinitamente.
+var ErrNoDownload = fmt.Errorf("resposta sem downloadLink")
+
 type Client struct {
 	baseMu     sync.RWMutex
 	base       string
@@ -161,6 +167,13 @@ type searchResponse struct {
 }
 
 func (c *Client) Search(query string) ([]Book, error) {
+	return c.SearchLanguages(query, c.languages)
+}
+
+// SearchLanguages busca books aplicando os idiomas informados na chamada (em vez dos fixos
+// do cliente). Uma lista vazia omite o filtro de idiomas (todos). Usada para variar o
+// metodo de busca entre as tentativas de uma wish.
+func (c *Client) SearchLanguages(query string, languages []string) ([]Book, error) {
 	if c.userID == "" || c.userKey == "" {
 		return nil, fmt.Errorf("nao autenticado")
 	}
@@ -168,7 +181,7 @@ func (c *Client) Search(query string) ([]Book, error) {
 	form.Set("message", query)
 	form.Set("page", "1")
 	form.Set("limit", "20")
-	for i, lang := range c.languages {
+	for i, lang := range languages {
 		form.Set(fmt.Sprintf("languages[%d]", i), lang)
 	}
 	for i, ext := range c.extensions {
@@ -278,7 +291,7 @@ func (c *Client) GetDownloadLink(id int, hash string) (string, error) {
 		return "", fmt.Errorf("API erro ao obter link: %s", strings.TrimSpace(string(body)))
 	}
 	if data.File.DownloadLink == "" {
-		return "", fmt.Errorf("resposta sem downloadLink")
+		return "", ErrNoDownload
 	}
 	return data.File.DownloadLink, nil
 }
@@ -370,7 +383,20 @@ func htmlResponse(contentType string) bool {
 	return strings.Contains(strings.ToLower(contentType), "text/html")
 }
 
+// SelectBestMatch devolve o melhor candidato aceito, ou nil. Mantido por compatibilidade.
 func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference []string) *Book {
+	r := RankCandidates(books, wishTitle, wishAuthor, preference)
+	if len(r) == 0 {
+		return nil
+	}
+	return &r[0]
+}
+
+// RankCandidates devolve, em ordem de qualidade, os candidatos que passam no piso de
+// aceite (livros plausivelmente relacionados ao pedido). A flexibilizacao usada entre as
+// tentativas de uma wish acontece na QUERY/estrategia de busca, nunca aqui: o piso de
+// match permanece o mesmo para nao aceitar um item errado.
+func RankCandidates(books []Book, wishTitle, wishAuthor string, preference []string) []Book {
 	if len(books) == 0 {
 		return nil
 	}
@@ -393,8 +419,7 @@ func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference []st
 
 	scored := make([]cand, 0, len(books))
 	for _, b := range books {
-		titleN := normalize(b.DisplayName())
-		titleSim, titleInc := similar(titleN, wishTitleN)
+		titleSim, titleInc := similar(normalize(b.DisplayName()), wishTitleN)
 		authorSim := 0.0
 		if wishAuthorN != "" {
 			authorSim, _ = similar(normalize(b.Author), wishAuthorN)
@@ -409,16 +434,11 @@ func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference []st
 	}
 
 	// Piso de aceite: descarta candidatos claramente nao relacionados ao pedido.
-	// Titulo e o criterio principal; o autor so reforca um titulo fraco, nunca
-	// aprova um livro que nao faz nenhum sentido com o pedido.
 	candidates := scored[:0]
 	for _, c := range scored {
 		if acceptable(c.titleSim, c.titleInc, c.authorSim, wishTitleN == "", wishAuthorN == "") {
 			candidates = append(candidates, c)
 		}
-	}
-	if len(candidates) == 0 {
-		return nil
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -434,7 +454,12 @@ func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference []st
 		}
 		return a.book.DisplayName() < b.book.DisplayName()
 	})
-	return &candidates[0].book
+
+	out := make([]Book, len(candidates))
+	for i, c := range candidates {
+		out[i] = c.book
+	}
+	return out
 }
 
 // acceptable decide se um candidato com as similaridades dadas ao pedido pode ser um match
@@ -510,4 +535,19 @@ func normalize(s string) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// TitleSimilarity expoe a semelhanca de titulo [0,1] tolerante a pequenos erros.
+func TitleSimilarity(a, b string) float64 {
+	sim, _ := similar(normalize(a), normalize(b))
+	return sim
+}
+
+// AuthorMatches indica se o autor do candidato corresponde razoavelmente ao autor da wish.
+func AuthorMatches(bookAuthor, wishAuthor string) bool {
+	if wishAuthor == "" {
+		return true
+	}
+	sim, _ := similar(normalize(bookAuthor), normalize(wishAuthor))
+	return sim >= 0.5 || sim > 0 && (strings.Contains(normalize(wishAuthor), normalize(bookAuthor)) || strings.Contains(normalize(bookAuthor), normalize(wishAuthor)))
 }

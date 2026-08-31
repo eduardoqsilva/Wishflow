@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -10,8 +11,23 @@ import (
 	"unicode"
 
 	"tome-wishlist-downloader/internal/config"
+	"tome-wishlist-downloader/internal/schedule"
 	"tome-wishlist-downloader/internal/tome"
 	"tome-wishlist-downloader/internal/zlib"
+)
+
+// refreshEvery ciclos antes de recarregar o cache do scheduler a partir do SQLite.
+const scheduleRefreshEvery = 10
+
+// wishOutcome descreve o resultado do processamento de uma wish dentro de um ciclo.
+type wishOutcome int
+
+const (
+	wishFailed    wishOutcome = iota // erro transitorio; pode tentar de novo
+	wishSuccess                       // livro baixado e enviado (fulfilled)
+	wishRefused                       // sem match aceitavel; marcada dismissed
+	wishScheduled                     // sem link apos tentativas; agendada p/ monitoramento
+	wishSkipped                       // agendada e ainda nao venceu; ignorada neste ciclo
 )
 
 func main() {
@@ -22,6 +38,13 @@ func main() {
 
 	tm := tome.New(cfg.TomeURL, cfg.TomeAPIToken)
 	fmt.Printf("tome-wishlist-downloader iniciado - Tome=%s, intervalo=%v\n", cfg.TomeURL, cfg.PollInterval)
+
+	sched, err := schedule.New(cfg.ScheduleDB)
+	if err != nil {
+		log.Fatalf("schedule: %v", err)
+	}
+	defer sched.Close()
+	fmt.Printf("schedule: monitoramento em %s (base=%v, teto=%v)\n", cfg.ScheduleDB, cfg.ScheduleBaseInterval, cfg.ScheduleMaxInterval)
 
 	var zc *zlib.Client
 	var pool *zlib.MirrorPool
@@ -44,8 +67,8 @@ func main() {
 		fmt.Printf("tome: tipo de livro %q (id=%d)\n", bt.Slug, bt.ID)
 	}
 
-	for {
-		runOnce(cfg, tm, zc, pool, bt)
+	for cycle := 1; ; cycle++ {
+		runOnce(cfg, tm, zc, pool, bt, sched, cycle)
 		time.Sleep(cfg.PollInterval)
 	}
 }
@@ -95,22 +118,25 @@ func authenticate(pool *zlib.MirrorPool, zc *zlib.Client) error {
 	return fmt.Errorf("autenticacao falhou em todos os mirrors testados")
 }
 
-func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.MirrorPool, bt *tome.BookType) {
+func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.MirrorPool, bt *tome.BookType, sched *schedule.Store, cycle int) {
+	// Recarrega o cache do scheduler periodicamente para espelhar o SQLite.
+	if cycle%scheduleRefreshEvery == 1 {
+		sched.Refresh()
+	}
+
 	wishes, err := tm.ListWishlist(cfg.WishlistStatus)
 	if err != nil {
 		log.Printf("erro listando wishlist: %v", err)
 		return
 	}
 
-	now := time.Now().Format("2006-01-02 15:04:05")
-	fmt.Printf("[%s] wishlist (%d itens)\n", now, len(wishes))
-	if len(wishes) == 0 {
-		fmt.Println("  (vazia)")
-		return
-	}
-	for _, w := range wishes {
-		fmt.Printf("  #%d [%s] %s (autor: %s | serie: %s)\n", w.ID, w.Status, w.Title, strVal(w.Author), strVal(w.Series))
-	}
+	now := time.Now()
+	fmt.Printf("[%s] wishlist (%d itens)\n", now.Format("2006-01-02 15:04:05"), len(wishes))
+
+	// Reconcilia o monitoramento: apaga do banco/cache qualquer wish que deixou de existir
+	// (sumiu) ou mudou de status no Tome (fulfilled/dismissed). Tambem identifica quais
+	// wishlist items existem de fato para comparar com o scheduler.
+	reconcileSchedule(cfg, tm, sched)
 
 	if zc == nil {
 		return
@@ -129,73 +155,231 @@ func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.Mi
 
 	processed := 0
 	for _, w := range wishes {
+		// Pula wish que esta agendada e ainda nao venceu (monitoramento em curso).
+		if due, ok := sched.ScheduledUntil(w.ID); ok && due.After(now) {
+			fmt.Printf("  #%d em monitoramento - proxima tentativa %s\n", w.ID, due.Format("2006-01-02 15:04"))
+			continue
+		}
+
 		if processed >= cfg.MaxDownloadsPerRun {
 			break
 		}
-		// A bot-challenged mirror is swapped for a fresh one mid-cycle: mark it
-		// blocked, re-authenticate against another host, then retry this wish once.
-		err := processWish(cfg, tm, zc, bt, w)
-		if _, ok := err.(*zlib.BotChallengeError); ok && pool != nil {
+
+		out := processWish(cfg, tm, zc, bt, sched, w, now)
+		if _, isBot := out.err.(*zlib.BotChallengeError); isBot && pool != nil {
 			log.Printf("wish #%d: mirror %s bloqueado por bot check, trocando de mirror...", w.ID, zc.Base())
 			pool.MarkBlocked(zc.Base())
 			if aerr := authenticate(pool, zc); aerr == nil {
-				err = processWish(cfg, tm, zc, bt, w)
+				out = processWish(cfg, tm, zc, bt, sched, w, now)
 			} else {
 				log.Printf("wish #%d: nao foi possivel trocar de mirror: %v", w.ID, aerr)
 			}
 		}
-		if err != nil {
-			log.Printf("wish #%d (%s): %v", w.ID, w.Title, err)
-			continue
+
+		switch out.kind {
+		case wishSuccess, wishRefused, wishScheduled:
+			// A wish foi resolvida (enviada/recusada) ou posta em monitoramento;
+			// conta como processada neste ciclo.
+			processed++
+			if out.kind != wishScheduled {
+				// Se terminou (fulfilled/recusada), nao deve continuar agendada.
+				if err := sched.Delete(w.ID); err != nil {
+					log.Printf("wish #%d: falha ao limpar agendamento: %v", w.ID, err)
+				}
+			}
+		case wishSkipped:
+			// Nao conta como processada.
+		case wishFailed:
+			if out.err != nil {
+				log.Printf("wish #%d (%s): %v", w.ID, w.Title, out.err)
+			}
+			// Nao conta como processada: o erro e transitorio, tenta de novo no ciclo.
 		}
-		processed++
 	}
 }
 
-func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.BookType, w tome.Wish) error {
-	query := w.Title
-	if w.Author != nil && *w.Author != "" {
-		query += " " + *w.Author
+// reconcileSchedule apaga agendamentos cujas wishes nao existem mais ou mudaram de status
+// no Tome. Lista os tres estados conhecidos e remove do scheduler os ids ausentes.
+func reconcileSchedule(cfg *config.Config, tm *tome.Client, sched *schedule.Store) {
+	// Sem agendamentos, nao ha o que reconciliar (evita 3 chamadas HTTP por ciclo).
+	if len(sched.All()) == 0 {
+		return
 	}
-	log.Printf("wish #%d: buscando \"%s\" no zlib...", w.ID, query)
-
-	books, err := zc.Search(query)
-	if err != nil {
-		log.Printf("wish #%d: livro NAO baixado - erro ao buscar \"%s\" no zlib: %v", w.ID, query, err)
-		return err
-	}
-	log.Printf("wish #%d: zlib retornou %d resultado(s) p/ \"%s\"", w.ID, len(books), query)
-	for i, b := range books {
-		if i >= 5 {
-			break
+	existing := make(map[int]bool)
+	for _, status := range []string{"open", "fulfilled", "dismissed"} {
+		list, err := tm.ListWishlist(status)
+		if err != nil {
+			// Falha ao listar um status; nao corre risco de apagar por engano, segue.
+			continue
 		}
-		log.Printf("wish #%d:   [%d] \"%s\" (%s, %s)", w.ID, b.ID, b.DisplayName(), b.Extension, b.Size)
+		for _, w := range list {
+			existing[w.ID] = true
+		}
 	}
 
-	best := zlib.SelectBestMatch(books, w.Title, strVal(w.Author), cfg.FormatPreference)
-	if best == nil {
-		// Nenhum resultado satisfaz o pedido. Em vez de ficar tentando em loop, recusamos
-		// esta wish: marcamos como dismissed para retira-la do fluxo (nao baixamos nada).
-		log.Printf("wish #%d: livro RECUSADO - nenhum resultado satisfaz o pedido \"%s\" (titulo=%q, autor=%q)", w.ID, query, w.Title, strVal(w.Author))
-		if err := tm.DismissWish(w.ID); err != nil {
-			log.Printf("wish #%d: livro recusado, mas falha ao marcar como dismissed no Tome: %v", w.ID, err)
-			return nil
+	for _, pw := range sched.All() {
+		if !existing[pw.WishID] {
+			log.Printf("schedule: wish #%d deixou de existir no Tome; removendo do monitoramento", pw.WishID)
+			if err := sched.Delete(pw.WishID); err != nil {
+				log.Printf("schedule: falha ao remover wish #%d: %v", pw.WishID, err)
+			}
 		}
-		fmt.Printf("wish #%d: marcada como dismissed (recusada) no Tome - nao sera processada novamente\n", w.ID)
+	}
+}
+
+// wishResult e o retorno de processWish para o runOnce tomar decisoes de contagem/reconciliacao.
+type wishResult struct {
+	kind wishOutcome
+	err  error
+}
+
+// processWish executa o fluxo de uma wish: ate 3 tentativas variadas de busca/match procurando
+// um livro com link baixavel. Se nenhum tiver link apos as 3 tentativas, agenda o monitoramento.
+// A flexibilizacao acontece apenas na QUERY/estrategia (autor, idioma), nunca no criterio de
+// match: um livro nao relacionado ao pedido continua sendo rejeitado.
+func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.BookType, sched *schedule.Store, w tome.Wish, now time.Time) wishResult {
+	author := strVal(w.Author)
+	mainLang := ""
+	if len(cfg.ZlibLanguages) > 0 {
+		mainLang = strings.ToLower(strings.TrimSpace(cfg.ZlibLanguages[0]))
+	}
+
+	// As 3 tentativas variadas. Cada uma busca de um jeito (query/idioma) e, para os
+	// candidatos aceitos, testa o link de download em cascata ate achar um baixavel.
+	var lastErr string
+	for attempt := 1; attempt <= 3; attempt++ {
+		books, err := searchAttempt(zc, w, author, mainLang, attempt)
+		if err != nil {
+			// Erro transitorio (rede/bot/quota): mantem a wish para o proximo ciclo.
+			return wishResult{kind: wishFailed, err: err}
+		}
+
+		ranked := zlib.RankCandidates(books, w.Title, author, cfg.FormatPreference)
+		ranked = filterByStrategy(ranked, w.Title, author, mainLang, attempt)
+
+		log.Printf("wish #%d: tentativa %d/3 - %d candidato(s) aceitos", w.ID, attempt, len(ranked))
+		if len(ranked) == 0 {
+			continue
+		}
+
+		// Testa os candidatos em cascata ate encontrar um com link disponivel.
+		n := cfg.ScheduleCascadeN
+		if n > len(ranked) {
+			n = len(ranked)
+		}
+		for i := 0; i < n; i++ {
+			b := ranked[i]
+			log.Printf("wish #%d:   candidato [%d] \"%s\" (%s) - checando link...", w.ID, b.ID, b.DisplayName(), b.Extension)
+			link, err := zc.GetDownloadLink(b.ID, b.Hash)
+			if err != nil {
+				if errors.Is(err, zlib.ErrNoDownload) {
+					log.Printf("wish #%d:   candidato sem link de download, tentando proximo...", w.ID)
+					continue
+				}
+				// Erro transitorio no link (rede/bot/quota).
+				return wishResult{kind: wishFailed, err: err}
+			}
+			// Tem link: baixa e envia. O resultado e terminal para esta wish (sucesso, ou
+			// erro transitorio que mantem a wish para o proximo ciclo).
+			log.Printf("wish #%d: match escolhido: \"%s\" (formato=%s, tamanho=%s, idioma=%s)", w.ID, b.DisplayName(), b.Extension, b.Size, b.Language)
+			return downloadAndUpload(cfg, tm, zc, bt, w, b, link)
+		}
+	}
+
+	// Chegou aqui sem sucesso: nenhum candidato com link (ou todos agendados). Agenda o
+	// monitoramento em vez de reprocessar infinitamente o mesmo livro.
+	if pw, ok := sched.Get(w.ID); ok {
+		// Ja agendada e venceu: re-agenda com backoff maior.
+		next, err := sched.Requeue(w.ID, cfg.ScheduleBaseInterval, cfg.ScheduleMaxInterval, cfg.ScheduleJitter, lastErr)
+		if err != nil {
+			log.Printf("wish #%d: falha ao re-agendar monitoramento: %v", w.ID, err)
+			return wishResult{kind: wishFailed, err: err}
+		}
+		attempts := pw.Attempts + 1
+		fmt.Printf("wish #%d: ainda sem link apos %d tentativas; re-agendada para %s (attempt %d)\n",
+			w.ID, attempts, next.Format("2006-01-02 15:04"), attempts)
+		return wishResult{kind: wishScheduled}
+	}
+
+	next := schedule.NextBackoff(now, 1, cfg.ScheduleBaseInterval, cfg.ScheduleMaxInterval, cfg.ScheduleJitter)
+	if err := sched.Upsert(w.ID, w.Title, author, next, lastErr, 1); err != nil {
+		log.Printf("wish #%d: falha ao agendar monitoramento: %v", w.ID, err)
+		return wishResult{kind: wishFailed, err: err}
+	}
+	fmt.Printf("wish #%d: sem link apos 3 tentativas; em monitoramento - proxima tentativa %s (24h)\n",
+		w.ID, next.Format("2006-01-02 15:04"))
+	return wishResult{kind: wishScheduled}
+}
+
+// searchAttempt executa a busca correspondente a tentativa informada, variando query/idioma.
+func searchAttempt(zc *zlib.Client, w tome.Wish, author string, mainLang string, attempt int) ([]zlib.Book, error) {
+	switch attempt {
+	case 1:
+		// Original: titulo + autor, idiomas do .env.
+		q := strings.TrimSpace(w.Title + " " + author)
+		log.Printf("wish #%d: busca %d/3 \"%s\" (idiomas do .env)", w.ID, attempt, q)
+		return zc.Search(q)
+	case 2:
+		// Flexibiliza o TITULO: foca no autor + idioma principal. A query usa o autor,
+		// ampliando o alcance, mas o filtro por estrategia exigira autor correspondente.
+		q := author
+		log.Printf("wish #%d: busca %d/3 p/ autor \"%s\" (idioma principal=%s)", w.ID, attempt, q, mainLang)
+		return zc.SearchLanguages(q, mainLangList(mainLang))
+	case 3:
+		// Foca titulo original + autor, ignorando idioma (pode haver versao pt com
+		// idioma incorreto no registro).
+		q := strings.TrimSpace(w.Title + " " + author)
+		log.Printf("wish #%d: busca %d/3 \"%s\" (todos os idiomas)", w.ID, attempt, q)
+		return zc.SearchLanguages(q, nil)
+	}
+	return nil, fmt.Errorf("tentativa invalida")
+}
+
+// filterByStrategy aplica o criterio de aceite moderado adicional de cada tentativa sobre a
+// lista ja filtrada pelo piso de match do RankCandidates. A flexibilizacao nunca aceita um
+// item claramente errado: so ajusta quao forte deve ser a relacao titulo/autor.
+func filterByStrategy(ranked []zlib.Book, wishTitle, wishAuthor, mainLang string, attempt int) []zlib.Book {
+	if len(ranked) == 0 {
+		return ranked
+	}
+	var out []zlib.Book
+	for _, b := range ranked {
+		switch attempt {
+		case 1:
+			// Estrito: aceita o que o RankCandidates ja aceitou.
+			out = append(out, b)
+		case 2:
+			// Autor corresponde E titulo com relacao minima (>=0.4). Evita livro de
+			// outro autor que compartilha apenas um titulo generico.
+			if zlib.AuthorMatches(b.Author, wishAuthor) && zlib.TitleSimilarity(b.DisplayName(), wishTitle) >= 0.4 {
+				out = append(out, b)
+			}
+		case 3:
+			// Autor + titulo forte; ignora o idioma (o idioma pode estar incorreto).
+			if zlib.AuthorMatches(b.Author, wishAuthor) && zlib.TitleSimilarity(b.DisplayName(), wishTitle) >= 0.5 {
+				out = append(out, b)
+			}
+		}
+	}
+	return out
+}
+
+func mainLangList(mainLang string) []string {
+	if mainLang == "" {
 		return nil
 	}
-	log.Printf("wish #%d: match escolhido: \"%s\" (formato=%s, tamanho=%s, idioma=%s)", w.ID, best.DisplayName(), best.Extension, best.Size, best.Language)
+	return []string{mainLang}
+}
 
-	dest := filepath.Join(cfg.DownloadDir, fileName(best))
+// downloadAndUpload baixa o livro escolhido (link ja obtido) e envia ao Tome. O retorno e
+// sempre terminal para a wish: sucesso (livro cumprido) ou erro transitorio/falha de upload
+// que mantem a wish para o proximo ciclo.
+func downloadAndUpload(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.BookType, w tome.Wish, b zlib.Book, link string) wishResult {
+	dest := filepath.Join(cfg.DownloadDir, fileName(&b))
 	if _, err := os.Stat(dest); os.IsNotExist(err) {
-		link, err := zc.GetDownloadLink(best.ID, best.Hash)
-		if err != nil {
-			log.Printf("wish #%d: livro NAO baixado - erro ao obter link de download de \"%s\" (%s): %v", w.ID, best.DisplayName(), best.Extension, err)
-			return err
-		}
 		if err := zc.Download(link, dest); err != nil {
-			log.Printf("wish #%d: livro NAO baixado - erro ao baixar \"%s\" para %s: %v", w.ID, best.DisplayName(), dest, err)
-			return err
+			log.Printf("wish #%d: livro NAO baixado - erro ao baixar \"%s\" para %s: %v", w.ID, b.DisplayName(), dest, err)
+			return wishResult{kind: wishFailed, err: err}
 		}
 		log.Printf("wish #%d: baixado para %s", w.ID, dest)
 	} else if err == nil {
@@ -212,7 +396,7 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 				log.Printf("wish #%d: upload ok (book id=%d) e arquivo local removido", w.ID, det.ID)
 			}
 			markFulfilled(tm, cfg.WishlistStatus, w, det)
-			return nil
+			return wishResult{kind: wishSuccess}
 		}
 		if attempt < cfg.UploadMaxRetries {
 			log.Printf("wish #%d: upload falhou (tentativa %d/%d): %v; nova tentativa em %v", w.ID, attempt, cfg.UploadMaxRetries, err, cfg.UploadRetryInterval)
@@ -221,7 +405,8 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 			log.Printf("wish #%d: upload falhou apos %d tentativas, arquivo mantido p/ proximo ciclo: %v", w.ID, cfg.UploadMaxRetries, err)
 		}
 	}
-	return nil
+	// Falha no upload: mantem para o proximo ciclo (nao pune como sem link).
+	return wishResult{kind: wishFailed, err: fmt.Errorf("upload falhou apos %d tentativas", cfg.UploadMaxRetries)}
 }
 
 // markFulfilled fecha o ciclo da wishlist: para cada wish que o livro enviado casou, marca

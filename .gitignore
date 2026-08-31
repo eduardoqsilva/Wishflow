@@ -20,6 +20,11 @@ tome-wishlist-downloader
 # Downloads (runtime artifacts)
 /downloads/
 
+# Schedule SQLite database (runtime monitoring state)
+/schedule.db
+/schedule.db-shm
+/schedule.db-wal
+
 # Test / coverage
 coverage.txt
 coverage.html
