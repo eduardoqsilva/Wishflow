@@ -32,6 +32,8 @@ type Store struct {
 	db *sql.DB
 
 	cache      map[int]PendingWish // wish_id -> registro
+	quotaLimit int                 // cota diaria de downloads do zlib (ex.: 10)
+	quotaPause int64               // unix seconds ate quando pausar por quota (0 = sem pausa)
 	ready      bool
 	lastLoaded time.Time
 }
@@ -83,6 +85,11 @@ func (s *Store) init() error {
 			updated_at     INTEGER NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_pending_next ON pending_wishes(next_attempt_at);
+
+		CREATE TABLE IF NOT EXISTS kv_store (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL DEFAULT ''
+		);
 	`)
 	return err
 }
@@ -100,7 +107,6 @@ func (s *Store) Refresh() {
 	if err != nil {
 		return
 	}
-	defer rows.Close()
 
 	next := make(map[int]PendingWish)
 	for rows.Next() {
@@ -110,9 +116,18 @@ func (s *Store) Refresh() {
 		}
 		next[pw.WishID] = pw
 	}
+	rows.Close()
+
+	// Recarrega tambem a cota e a pausa global por quota (persistidas no banco).
+	quotaLimit := 0
+	quotaPause := int64(0)
+	s.db.QueryRow(`SELECT value FROM kv_store WHERE key = 'quota_limit'`).Scan(&quotaLimit)
+	s.db.QueryRow(`SELECT value FROM kv_store WHERE key = 'quota_pause_until'`).Scan(&quotaPause)
 
 	s.mu.Lock()
 	s.cache = next
+	s.quotaLimit = quotaLimit
+	s.quotaPause = quotaPause
 	s.ready = true
 	s.lastLoaded = time.Now()
 	s.mu.Unlock()
@@ -216,6 +231,59 @@ func (s *Store) Delete(wishID int) error {
 	}
 	s.mu.Lock()
 	delete(s.cache, wishID)
+	s.mu.Unlock()
+	return nil
+}
+
+// Quota devolve a cota diaria de downloads (limite) e o instante ate o qual o processamento
+// esta pausado por quota (0 se nao ha pausa), alem de se ha um registro persistido.
+func (s *Store) Quota() (limit int, until time.Time, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.quotaPause <= 0 && s.quotaLimit <= 0 {
+		return 0, time.Time{}, false
+	}
+	return s.quotaLimit, time.Unix(s.quotaPause, 0), true
+}
+
+// SetQuota persiste a cota diaria de downloads e o instante de reset/pausa do processamento.
+// Como fica no SQLite, sobrevive a reload e updates do programa. O reset ocorre apos 24h
+// (quando o prazo informado vence e o fluxo retoma).
+func (s *Store) SetQuota(limit int, until time.Time) error {
+	unix := until.Unix()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
+		`INSERT INTO kv_store (key, value) VALUES ('quota_pause_until', ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, unix); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO kv_store (key, value) VALUES ('quota_limit', ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, limit); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.quotaPause = unix
+	s.quotaLimit = limit
+	s.mu.Unlock()
+	return nil
+}
+
+// ClearQuota remove a cota e a pausa por quota (usada quando o prazo vence e o fluxo retoma).
+func (s *Store) ClearQuota() error {
+	if _, err := s.db.Exec(`DELETE FROM kv_store WHERE key IN ('quota_pause_until', 'quota_limit')`); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.quotaPause = 0
+	s.quotaLimit = 0
 	s.mu.Unlock()
 	return nil
 }

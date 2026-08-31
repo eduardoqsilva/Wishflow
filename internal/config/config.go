@@ -29,11 +29,13 @@ type Config struct {
 	DownloadDir        string
 	MaxDownloadsPerRun int
 
-	ScheduleDB          string
+	ScheduleDB           string
 	ScheduleBaseInterval time.Duration
-	ScheduleMaxInterval time.Duration
-	ScheduleJitter      time.Duration
-	ScheduleCascadeN    int
+	ScheduleMaxInterval  time.Duration
+	ScheduleJitter       time.Duration
+	ScheduleCascadeN     int
+	QuotaPause           time.Duration
+	ZlibQuotaLimit       int
 }
 
 func Load(path string) (*Config, error) {
@@ -64,7 +66,9 @@ func Load(path string) (*Config, error) {
 	cfg.ScheduleBaseInterval = dfltDuration(getEnv("SCHEDULE_BASE_INTERVAL", "24h"), 24*time.Hour)
 	cfg.ScheduleMaxInterval = dfltDuration(getEnv("SCHEDULE_MAX_INTERVAL", "192h"), 192*time.Hour) // 192h = 8 dias
 	cfg.ScheduleJitter = dfltDuration(getEnv("SCHEDULE_JITTER", "2h"), 2*time.Hour)
-	cfg.ScheduleCascadeN = atoiDefault(getEnv("SCHEDULE_CASCADE_N", "2"), 2)
+	cfg.ScheduleCascadeN = atoiDefault(getEnv("SCHEDULE_CASCADE_N", "20"), 20)
+	cfg.QuotaPause = dfltDuration(getEnv("ZLIB_QUOTA_PAUSE", "24h"), 24*time.Hour)
+	cfg.ZlibQuotaLimit = atoiDefault(getEnv("ZLIB_DAILY_LIMIT", "10"), 10)
 
 	if cfg.TomeURL == "" || cfg.TomeAPIToken == "" {
 		return nil, fmt.Errorf("TOME_URL e TOME_API_TOKEN sao obrigatorios (defina no .env)")

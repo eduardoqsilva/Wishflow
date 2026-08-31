@@ -24,10 +24,11 @@ type wishOutcome int
 
 const (
 	wishFailed    wishOutcome = iota // erro transitorio; pode tentar de novo
-	wishSuccess                       // livro baixado e enviado (fulfilled)
-	wishRefused                       // sem match aceitavel; marcada dismissed
-	wishScheduled                     // sem link apos tentativas; agendada p/ monitoramento
-	wishSkipped                       // agendada e ainda nao venceu; ignorada neste ciclo
+	wishSuccess                      // livro baixado e enviado (fulfilled)
+	wishRefused                      // sem match aceitavel; marcada dismissed
+	wishScheduled                    // sem link apos tentativas; agendada p/ monitoramento
+	wishSkipped                      // agendada e ainda nao venceu; ignorada neste ciclo
+	wishQuota                        // quota diaria esgotada; pausa todo o processamento
 )
 
 func main() {
@@ -124,13 +125,26 @@ func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.Mi
 		sched.Refresh()
 	}
 
+	now := time.Now()
+
+	// Pausa por quota: se a conta atingiu o limite diario, nao checa nada (nem a wishlist)
+	// ate o contador resetar. O prazo fica persistido no banco e sobrevive a reload/update.
+	if limit, due, ok := sched.Quota(); ok && due.After(now) {
+		fmt.Printf("[%s] quota esgotada (%d downloads/dia) - processamento pausado, retomando apos %s\n",
+			now.Format("2006-01-02 15:04:05"), limit, due.Format("2006-01-02 15:04"))
+		return
+	}
+	// Pausa venceu (24h): limpa e segue o fluxo normal.
+	if _, _, ok := sched.Quota(); ok {
+		sched.ClearQuota()
+	}
+
 	wishes, err := tm.ListWishlist(cfg.WishlistStatus)
 	if err != nil {
 		log.Printf("erro listando wishlist: %v", err)
 		return
 	}
 
-	now := time.Now()
 	fmt.Printf("[%s] wishlist (%d itens)\n", now.Format("2006-01-02 15:04:05"), len(wishes))
 
 	// Reconcilia o monitoramento: apaga do banco/cache qualquer wish que deixou de existir
@@ -148,7 +162,13 @@ func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.Mi
 	} else {
 		fmt.Printf("zlib: downloads restantes hoje: %d\n", remaining)
 		if remaining <= 0 {
-			fmt.Println("quota diaria de downloads esgotada - pulando ciclo")
+			// Quota esgotada confirmada pelo profile: pausa o processamento por um ciclo
+			// de reset diario e nao processa mais nada neste ciclo.
+			until := now.Add(cfg.QuotaPause)
+			if serr := sched.SetQuota(cfg.ZlibQuotaLimit, until); serr != nil {
+				log.Printf("zlib: falha ao registrar pausa de quota: %v", serr)
+			}
+			fmt.Printf("quota diaria de downloads esgotada - pausando ate %s\n", until.Format("2006-01-02 15:04"))
 			return
 		}
 	}
@@ -189,6 +209,15 @@ func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.Mi
 			}
 		case wishSkipped:
 			// Nao conta como processada.
+		case wishQuota:
+			// Quota esgotada durante o processamento: pausa tudo ate o reset diario e
+			// para de processar o restante deste ciclo.
+			until := time.Now().Add(cfg.QuotaPause)
+			if serr := sched.SetQuota(cfg.ZlibQuotaLimit, until); serr != nil {
+				log.Printf("wish #%d: falha ao registrar pausa de quota: %v", w.ID, serr)
+			}
+			fmt.Printf("wish #%d: quota esgotada - pausando todo o processamento ate %s\n", w.ID, until.Format("2006-01-02 15:04"))
+			return
 		case wishFailed:
 			if out.err != nil {
 				log.Printf("wish #%d (%s): %v", w.ID, w.Title, out.err)
@@ -254,10 +283,21 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 			return wishResult{kind: wishFailed, err: err}
 		}
 
-		ranked := zlib.RankCandidates(books, w.Title, author, cfg.FormatPreference)
+		// Ordem BRUTA que o zlib devolve (antes de qualquer ranking/filtro) - p/ calibracao.
+		log.Printf("wish #%d:   [bruto %d/3] %d resultado(s) na ordem da API:", w.ID, attempt, len(books))
+		for i, b := range books {
+			log.Printf("wish #%d:   bruto[%d] id=[%d] \"%s\" (%s) ano=%v autor=%q idioma=%q | library=%s/book/%d/%s",
+				w.ID, i, b.ID, b.DisplayName(), b.Extension, yearVal(b.Year), b.Author, b.Language, zc.Base(), b.ID, b.Hash)
+		}
+
+		ranked := zlib.RankCandidates(books, w.Title, author, cfg.FormatPreference, mainLang)
 		ranked = filterByStrategy(ranked, w.Title, author, mainLang, attempt)
 
-		log.Printf("wish #%d: tentativa %d/3 - %d candidato(s) aceitos", w.ID, attempt, len(ranked))
+		log.Printf("wish #%d: tentativa %d/3 - %d candidato(s) aceitos (de %d retornados pelo zlib)", w.ID, attempt, len(ranked), len(books))
+		for i, b := range ranked {
+			log.Printf("wish #%d:   rank[%d] id=[%d] \"%s\" (%s) ano=%v autor=%q idioma=%q | library=%s/book/%d/%s",
+				w.ID, i, b.ID, b.DisplayName(), b.Extension, yearVal(b.Year), b.Author, b.Language, zc.Base(), b.ID, b.Hash)
+		}
 		if len(ranked) == 0 {
 			continue
 		}
@@ -267,16 +307,20 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 		if n > len(ranked) {
 			n = len(ranked)
 		}
+		log.Printf("wish #%d:   testando ateh %d candidato(s) em cascata", w.ID, n)
 		for i := 0; i < n; i++ {
 			b := ranked[i]
-			log.Printf("wish #%d:   candidato [%d] \"%s\" (%s) - checando link...", w.ID, b.ID, b.DisplayName(), b.Extension)
+			log.Printf("wish #%d:   candidato [%d] (rank %d/%d) \"%s\" (%s) - checando link...", w.ID, b.ID, i+1, n, b.DisplayName(), b.Extension)
 			link, err := zc.GetDownloadLink(b.ID, b.Hash)
 			if err != nil {
 				if errors.Is(err, zlib.ErrNoDownload) {
 					log.Printf("wish #%d:   candidato sem link de download, tentando proximo...", w.ID)
 					continue
 				}
-				// Erro transitorio no link (rede/bot/quota).
+				if errors.Is(err, zlib.ErrQuota) {
+					return wishResult{kind: wishQuota, err: err}
+				}
+				// Erro transitorio no link (rede/bot).
 				return wishResult{kind: wishFailed, err: err}
 			}
 			// Tem link: baixa e envia. O resultado e terminal para esta wish (sucesso, ou
@@ -320,10 +364,11 @@ func searchAttempt(zc *zlib.Client, w tome.Wish, author string, mainLang string,
 		log.Printf("wish #%d: busca %d/3 \"%s\" (idiomas do .env)", w.ID, attempt, q)
 		return zc.Search(q)
 	case 2:
-		// Flexibiliza o TITULO: foca no autor + idioma principal. A query usa o autor,
-		// ampliando o alcance, mas o filtro por estrategia exigira autor correspondente.
-		q := author
-		log.Printf("wish #%d: busca %d/3 p/ autor \"%s\" (idioma principal=%s)", w.ID, attempt, q, mainLang)
+		// Busca SO PELO TITULO + idioma principal: espelha a busca manual que costuma
+		// achar a edicao correta mesmo quando o autor-combinado a esconde. O filtro por
+		// estrategia (filterByStrategy) ainda exige autor correspondente + titulo forte.
+		q := strings.TrimSpace(w.Title)
+		log.Printf("wish #%d: busca %d/3 apenas p/ titulo \"%s\" (idioma principal=%s)", w.ID, attempt, q, mainLang)
 		return zc.SearchLanguages(q, mainLangList(mainLang))
 	case 3:
 		// Foca titulo original + autor, ignorando idioma (pode haver versao pt com
@@ -349,8 +394,9 @@ func filterByStrategy(ranked []zlib.Book, wishTitle, wishAuthor, mainLang string
 			// Estrito: aceita o que o RankCandidates ja aceitou.
 			out = append(out, b)
 		case 2:
-			// Autor corresponde E titulo com relacao minima (>=0.4). Evita livro de
-			// outro autor que compartilha apenas um titulo generico.
+			// Busca foi so pelo titulo, entao exige reforco: autor corresponde E titulo
+			// com relacao minima (>=0.4). Evita livro de outro autor que compartilha
+			// apenas um titulo generico.
 			if zlib.AuthorMatches(b.Author, wishAuthor) && zlib.TitleSimilarity(b.DisplayName(), wishTitle) >= 0.4 {
 				out = append(out, b)
 			}
@@ -506,4 +552,11 @@ func strVal(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+func yearVal(y *int) any {
+	if y == nil {
+		return ""
+	}
+	return *y
 }

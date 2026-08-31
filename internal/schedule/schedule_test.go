@@ -61,6 +61,41 @@ func TestStoreInMemory(t *testing.T) {
 	}
 }
 
+func TestQuotaPausePersistsAcrossRefresh(t *testing.T) {
+	s, err := NewWithOptions(Options{DBPath: ":memory:"})
+	if err != nil {
+		t.Fatalf("NewWithOptions: %v", err)
+	}
+	defer s.Close()
+
+	if _, _, ok := s.Quota(); ok {
+		t.Fatalf("nao deveria haver quota no inicio")
+	}
+
+	due := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	if err := s.SetQuota(10, due); err != nil {
+		t.Fatalf("SetQuota: %v", err)
+	}
+	if limit, d, ok := s.Quota(); !ok || limit != 10 || !d.Equal(due) {
+		t.Fatalf("esperado limit=10 ate %v, got limit=%d ate %v ok=%v", due, limit, d, ok)
+	}
+
+	// Simula um reload: Refresh recarrega cota e pausa do banco.
+	s.Refresh()
+	if limit, d, ok := s.Quota(); !ok || limit != 10 || !d.Equal(due) {
+		t.Fatalf("apos Refresh deveria manter limit=10 ate %v, got limit=%d ate %v ok=%v", due, limit, d, ok)
+	}
+
+	// Clear remove a cota e a pausa.
+	if err := s.ClearQuota(); err != nil {
+		t.Fatalf("ClearQuota: %v", err)
+	}
+	s.Refresh()
+	if _, _, ok := s.Quota(); ok {
+		t.Fatalf("apos Clear nao deveria haver quota")
+	}
+}
+
 func TestNextBackoffCapAtMax(t *testing.T) {
 	base := 24 * time.Hour
 	max := 192 * time.Hour

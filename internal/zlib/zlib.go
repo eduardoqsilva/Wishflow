@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -23,6 +24,11 @@ const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, li
 // bot check, quota), este e permanente para aquele registro: tentar outro candidato ou
 // agendar a wish, em vez de reprocessar o mesmo livro infinitamente.
 var ErrNoDownload = fmt.Errorf("resposta sem downloadLink")
+
+// ErrQuota indica que a conta atingiu o limite diario de downloads do zlib. E transitorio
+// (reset diario) e afeta TODOS os livros naquele momento: nao vale tentar outros candidatos,
+// e sim pausar o processamento ate o contador resetar.
+var ErrQuota = fmt.Errorf("quota diaria de downloads esgotada")
 
 type Client struct {
 	baseMu     sync.RWMutex
@@ -257,6 +263,7 @@ func (c *Client) RemainingDownloads() (int, error) {
 
 func (c *Client) GetDownloadLink(id int, hash string) (string, error) {
 	endpoint := fmt.Sprintf("%s/eapi/book/%d/%s/file", c.currentBase(), id, hash)
+	log.Printf("zlib: GetDownloadLink id=%d - API: %s | library: %s/book/%d/%s", id, endpoint, c.currentBase(), id, hash)
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return "", err
@@ -269,30 +276,47 @@ func (c *Client) GetDownloadLink(id int, hash string) (string, error) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+	ct := resp.Header.Get("Content-Type")
+	log.Printf("zlib: GetDownloadLink id=%d - HTTP %d, content-type=%q", id, resp.StatusCode, ct)
 	if resp.StatusCode != http.StatusOK {
 		if looksLikeBotChallenge(body) {
+			log.Printf("zlib: GetDownloadLink id=%d - BOT CHECK (resposta nao-JSON)", id)
 			return "", &BotChallengeError{Base: c.currentBase()}
 		}
+		log.Printf("zlib: GetDownloadLink id=%d - corpo: %s", id, strings.TrimSpace(string(body)))
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	if htmlResponse(resp.Header.Get("Content-Type")) {
+	if htmlResponse(ct) {
+		log.Printf("zlib: GetDownloadLink id=%d - QUOTA/HTML: %s", id, strings.TrimSpace(string(body)))
 		return "", fmt.Errorf("quota de downloads diaria esgotada (resposta HTML)")
 	}
 	var data struct {
 		Success json.RawMessage `json:"success"`
 		File    struct {
-			DownloadLink string `json:"downloadLink"`
+			DownloadLink  string `json:"downloadLink"`
+			AllowDownload *bool  `json:"allowDownload"`
 		} `json:"file"`
 	}
 	if err := json.Unmarshal(body, &data); err != nil {
+		log.Printf("zlib: GetDownloadLink id=%d - JSON invalido: %s", id, strings.TrimSpace(string(body)))
 		return "", err
 	}
 	if !loginSuccess(data.Success) {
+		log.Printf("zlib: GetDownloadLink id=%d - success=falso, corpo: %s", id, strings.TrimSpace(string(body)))
 		return "", fmt.Errorf("API erro ao obter link: %s", strings.TrimSpace(string(body)))
 	}
+	// A API devolve success=1 mas allowDownload=false + disallowDownloadMessage quando a
+	// conta atingiu o limite diario. Isso nao e "livro sem link": afeta todos os livros e
+	// so acaba no reset diario, entao tratamos como quota (transitorio).
+	if data.File.AllowDownload != nil && !*data.File.AllowDownload {
+		log.Printf("zlib: GetDownloadLink id=%d - QUOTA: allowDownload=false (limite diario atingido)", id)
+		return "", ErrQuota
+	}
 	if data.File.DownloadLink == "" {
+		log.Printf("zlib: GetDownloadLink id=%d - sucesso porem downloadLink VAZIO (sem download). corpo: %s", id, strings.TrimSpace(string(body)))
 		return "", ErrNoDownload
 	}
+	log.Printf("zlib: GetDownloadLink id=%d - TEM downloadLink", id)
 	return data.File.DownloadLink, nil
 }
 
@@ -385,7 +409,7 @@ func htmlResponse(contentType string) bool {
 
 // SelectBestMatch devolve o melhor candidato aceito, ou nil. Mantido por compatibilidade.
 func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference []string) *Book {
-	r := RankCandidates(books, wishTitle, wishAuthor, preference)
+	r := RankCandidates(books, wishTitle, wishAuthor, preference, "")
 	if len(r) == 0 {
 		return nil
 	}
@@ -396,7 +420,11 @@ func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference []st
 // aceite (livros plausivelmente relacionados ao pedido). A flexibilizacao usada entre as
 // tentativas de uma wish acontece na QUERY/estrategia de busca, nunca aqui: o piso de
 // match permanece o mesmo para nao aceitar um item errado.
-func RankCandidates(books []Book, wishTitle, wishAuthor string, preference []string) []Book {
+//
+// mainLang (opcional, ex. "portuguese") e usado como criterio de desempate forte dentro
+// de candidatos com titulo equivalente: edicoes no idioma principal sobem acima das de
+// outros idiomas (epub ingles perde para azw3 portugues, por exemplo).
+func RankCandidates(books []Book, wishTitle, wishAuthor string, preference []string, mainLang string) []Book {
 	if len(books) == 0 {
 		return nil
 	}
@@ -408,6 +436,7 @@ func RankCandidates(books []Book, wishTitle, wishAuthor string, preference []str
 
 	wishTitleN := normalize(wishTitle)
 	wishAuthorN := normalize(wishAuthor)
+	mainLangN := strings.ToLower(strings.TrimSpace(mainLang))
 
 	type cand struct {
 		book        Book
@@ -415,6 +444,7 @@ func RankCandidates(books []Book, wishTitle, wishAuthor string, preference []str
 		titleInc    bool
 		authorSim   float64
 		formatScore int
+		langScore   int
 	}
 
 	scored := make([]cand, 0, len(books))
@@ -424,12 +454,17 @@ func RankCandidates(books []Book, wishTitle, wishAuthor string, preference []str
 		if wishAuthorN != "" {
 			authorSim, _ = similar(normalize(b.Author), wishAuthorN)
 		}
+		langScore := 0
+		if mainLangN != "" && strings.ToLower(strings.TrimSpace(b.Language)) == mainLangN {
+			langScore = 1
+		}
 		scored = append(scored, cand{
 			book:        b,
 			titleSim:    titleSim,
 			titleInc:    titleInc,
 			authorSim:   authorSim,
 			formatScore: prefOrder[strings.ToLower(b.Extension)],
+			langScore:   langScore,
 		})
 	}
 
@@ -446,11 +481,17 @@ func RankCandidates(books []Book, wishTitle, wishAuthor string, preference []str
 		if a.titleSim != b.titleSim {
 			return a.titleSim > b.titleSim
 		}
-		if a.authorSim != b.authorSim {
-			return a.authorSim > b.authorSim
+		// Dentro de titulos equivalentes, prioriza o idioma principal (.env primeiro
+		// idioma). Assim a edicao no idioma desejado vence outras edicoes do mesmo titulo.
+		if a.langScore != b.langScore {
+			return a.langScore > b.langScore
 		}
+		// Em seguida o formato preferido (.env ZLIB_FORMAT_PREFERENCE, ex. epub > azw3).
 		if a.formatScore != b.formatScore {
 			return a.formatScore > b.formatScore
+		}
+		if a.authorSim != b.authorSim {
+			return a.authorSim > b.authorSim
 		}
 		return a.book.DisplayName() < b.book.DisplayName()
 	})
