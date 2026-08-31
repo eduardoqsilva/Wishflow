@@ -76,9 +76,18 @@ func (c *Client) EnsureBookType(slug, label string) (*BookType, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := range types {
-		if types[i].Slug == slug || strings.EqualFold(types[i].Label, label) {
-			return &types[i], nil
+	if slug != "" {
+		for i := range types {
+			if types[i].Slug == slug {
+				return &types[i], nil
+			}
+		}
+	}
+	if label != "" {
+		for i := range types {
+			if strings.EqualFold(types[i].Label, label) {
+				return &types[i], nil
+			}
 		}
 	}
 	return c.CreateBookType(label, slug)

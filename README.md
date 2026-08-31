@@ -114,10 +114,16 @@ ficam persistidos na máquina host durante a execução.
 | `TOME_API_TOKEN` | sim | — | Token de API com permissão de admin |
 | `TOME_POLL_INTERVAL` | não | `60` | Segundos entre cada checagem da wishlist |
 | `TOME_WISHLIST_STATUS` | não | `open` | Status a processar: `open`, `fulfilled`, `dismissed` |
-| `TOME_BOOK_TYPE_SLUG` | não | `wishlist` | Slug do tipo de livro usado nos uploads |
+| `TOME_BOOK_TYPE_SLUG` | não | `wishlist` | Slug do tipo de livro usado nos uploads (prioridade sobre o label) |
 | `TOME_BOOK_TYPE_LABEL` | não | `Wishlist` | Label do tipo de livro |
 | `TOME_UPLOAD_RETRY_INTERVAL` | não | `60` | Segundos entre tentativas de upload |
 | `TOME_UPLOAD_MAX_RETRIES` | não | `3` | Máximo de tentativas de upload |
+
+> **Sobre o tipo de livro (book type):** o `TOME_BOOK_TYPE_SLUG` tem **prioridade**. O
+> programa primeiro procura um tipo existente com esse slug exato; se não encontrar, procura
+> por um label equivalente (case-insensitive); se ainda assim não achar, **cria** um novo tipo
+> com o slug e label declarados. Dica: use o slug do tipo que você já usa no Tome (ex.
+> `wishlist-imported`) para apontar os uploads para ele, em vez de depender do formato do label.
 
 ### Z-Library
 
