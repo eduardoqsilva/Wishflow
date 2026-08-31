@@ -1,3 +1,4 @@
+name: tome-wishlist-downloader
 services:
   tome-wishlist-downloader:
     build:

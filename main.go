@@ -161,11 +161,13 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 
 	books, err := zc.Search(query)
 	if err != nil {
+		log.Printf("wish #%d: livro NAO baixado - erro ao buscar \"%s\" no zlib: %v", w.ID, query, err)
 		return err
 	}
 	best := zlib.SelectBestMatch(books, w.Title, strVal(w.Author), cfg.FormatPreference, cfg.AbsoluteFormats)
 	if best == nil {
-		return fmt.Errorf("nenhum resultado encontrado")
+		log.Printf("wish #%d: livro NAO baixado - nao existe no zlib (nenhum resultado para \"%s\")", w.ID, query)
+		return fmt.Errorf("livro nao existe no zlib (nenhum resultado)")
 	}
 	log.Printf("wish #%d: match \"%s\" (%s, %s)", w.ID, best.DisplayName(), best.Extension, best.Size)
 
@@ -173,9 +175,11 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 	if _, err := os.Stat(dest); os.IsNotExist(err) {
 		link, err := zc.GetDownloadLink(best.ID, best.Hash)
 		if err != nil {
+			log.Printf("wish #%d: livro NAO baixado - erro ao obter link de download de \"%s\" (%s): %v", w.ID, best.DisplayName(), best.Extension, err)
 			return err
 		}
 		if err := zc.Download(link, dest); err != nil {
+			log.Printf("wish #%d: livro NAO baixado - erro ao baixar \"%s\" para %s: %v", w.ID, best.DisplayName(), dest, err)
 			return err
 		}
 		log.Printf("wish #%d: baixado para %s", w.ID, dest)
