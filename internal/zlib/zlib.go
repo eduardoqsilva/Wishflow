@@ -370,85 +370,131 @@ func htmlResponse(contentType string) bool {
 	return strings.Contains(strings.ToLower(contentType), "text/html")
 }
 
-func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference, absolute []string) *Book {
+func SelectBestMatch(books []Book, wishTitle, wishAuthor string, preference []string) *Book {
 	if len(books) == 0 {
 		return nil
 	}
 
-	absSet := make(map[string]bool, len(absolute))
-	for _, a := range absolute {
-		absSet[strings.ToLower(strings.TrimSpace(a))] = true
-	}
 	prefOrder := make(map[string]int, len(preference))
 	for i, f := range preference {
 		prefOrder[strings.ToLower(strings.TrimSpace(f))] = len(preference) - i
 	}
 
-	candidates := books
-	if usesAbsolute := hasAny(books, absSet); usesAbsolute {
-		var filtered []Book
-		for _, b := range books {
-			if absSet[strings.ToLower(b.Extension)] {
-				filtered = append(filtered, b)
-			}
-		}
-		candidates = filtered
+	wishTitleN := normalize(wishTitle)
+	wishAuthorN := normalize(wishAuthor)
+
+	type cand struct {
+		book        Book
+		titleSim    float64
+		titleInc    bool
+		authorSim   float64
+		formatScore int
 	}
 
-	wishTitle = normalize(wishTitle)
-	wishAuthor = normalize(wishAuthor)
+	scored := make([]cand, 0, len(books))
+	for _, b := range books {
+		titleN := normalize(b.DisplayName())
+		titleSim, titleInc := similar(titleN, wishTitleN)
+		authorSim := 0.0
+		if wishAuthorN != "" {
+			authorSim, _ = similar(normalize(b.Author), wishAuthorN)
+		}
+		scored = append(scored, cand{
+			book:        b,
+			titleSim:    titleSim,
+			titleInc:    titleInc,
+			authorSim:   authorSim,
+			formatScore: prefOrder[strings.ToLower(b.Extension)],
+		})
+	}
+
+	// Piso de aceite: descarta candidatos claramente nao relacionados ao pedido.
+	// Titulo e o criterio principal; o autor so reforca um titulo fraco, nunca
+	// aprova um livro que nao faz nenhum sentido com o pedido.
+	candidates := scored[:0]
+	for _, c := range scored {
+		if acceptable(c.titleSim, c.titleInc, c.authorSim, wishTitleN == "", wishAuthorN == "") {
+			candidates = append(candidates, c)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
-		ri := candidateRank(candidates[i], prefOrder, wishTitle, wishAuthor)
-		rj := candidateRank(candidates[j], prefOrder, wishTitle, wishAuthor)
-		if ri.format != rj.format {
-			return ri.format > rj.format
+		a, b := candidates[i], candidates[j]
+		if a.titleSim != b.titleSim {
+			return a.titleSim > b.titleSim
 		}
-		if ri.score != rj.score {
-			return ri.score > rj.score
+		if a.authorSim != b.authorSim {
+			return a.authorSim > b.authorSim
 		}
-		return candidates[i].DisplayName() < candidates[j].DisplayName()
+		if a.formatScore != b.formatScore {
+			return a.formatScore > b.formatScore
+		}
+		return a.book.DisplayName() < b.book.DisplayName()
 	})
-	return &candidates[0]
+	return &candidates[0].book
 }
 
-type grade struct {
-	format int
-	score  float64
-}
-
-func candidateRank(b Book, prefOrder map[string]int, wishTitle, wishAuthor string) grade {
-	format := prefOrder[strings.ToLower(b.Extension)]
-
-	title := normalize(b.DisplayName())
-	score := 0.0
-	if wishTitle != "" && title != "" {
-		if title == wishTitle {
-			score += 2
-		} else if strings.Contains(title, wishTitle) || strings.Contains(wishTitle, title) {
-			score += 1
-		} else {
-			score += overlap(title, wishTitle)
-		}
+// acceptable decide se um candidato com as similaridades dadas ao pedido pode ser um match
+// plausivel. noWishTitle/noWishAuthor indicam quando o pedido nao possui aquele campo.
+func acceptable(titleSim float64, titleInc bool, authorSim float64, noWishTitle, noWishAuthor bool) bool {
+	if noWishTitle {
+		// Sem titulo para comparar, exige autor razoavel quando houver.
+		return noWishAuthor || titleSim > 0 || authorSim >= 0.5
 	}
-	authorNorm := normalize(b.Author)
-	if wishAuthor != "" && authorNorm != "" {
-		if authorNorm == wishAuthor {
-			score += 1
-		} else if strings.Contains(authorNorm, wishAuthor) || strings.Contains(wishAuthor, authorNorm) {
-			score += 0.5
-		}
+	if titleInc || titleSim >= 0.6 {
+		// Titulo fortemente relacionado (exato, contido ou quase igual).
+		return true
 	}
-	return grade{format: format, score: score}
-}
-
-func hasAny(books []Book, want map[string]bool) bool {
-	for _, b := range books {
-		if want[strings.ToLower(b.Extension)] {
-			return true
-		}
+	if titleSim >= 0.35 && (noWishAuthor || authorSim >= 0.5) {
+		// Titulo parcial (pequenos erros de escrita) reforcado pelo autor.
+		return true
 	}
 	return false
+}
+
+// similar calcula uma semelhanca [0,1] tolerante a pequenos erros de escrita usando
+// bigramas de caracteres. O segundo retorno indica se um dos textos esta contido no outro.
+func similar(a, b string) (float64, bool) {
+	if a == "" && b == "" {
+		return 1.0, true
+	}
+	if a == "" || b == "" {
+		return 0.0, false
+	}
+	contained := strings.Contains(a, b) || strings.Contains(b, a)
+	if a == b {
+		return 1.0, true
+	}
+	return jaccard(bigrams(a), bigrams(b)), contained
+}
+
+func bigrams(s string) map[string]bool {
+	m := make(map[string]bool)
+	r := []rune(s)
+	for i := 0; i+1 < len(r); i++ {
+		m[string(r[i:i+2])] = true
+	}
+	return m
+}
+
+func jaccard(a, b map[string]bool) float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return 1.0
+	}
+	inter := 0
+	for k := range a {
+		if b[k] {
+			inter++
+		}
+	}
+	union := len(a) + len(b) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
 }
 
 func normalize(s string) string {
@@ -464,23 +510,4 @@ func normalize(s string) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
-}
-
-func overlap(a, b string) float64 {
-	ta := strings.Fields(a)
-	tb := strings.Fields(b)
-	if len(ta) == 0 || len(tb) == 0 {
-		return 0
-	}
-	seen := make(map[string]bool, len(ta))
-	for _, t := range ta {
-		seen[t] = true
-	}
-	common := 0
-	for _, t := range tb {
-		if seen[t] {
-			common++
-		}
-	}
-	return float64(common) / float64(len(tb))
 }

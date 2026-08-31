@@ -26,7 +26,6 @@ type Config struct {
 	ZlibLanguages      []string
 	ZlibOrder          string
 	FormatPreference   []string
-	AbsoluteFormats    []string
 	DownloadDir        string
 	MaxDownloadsPerRun int
 }
@@ -46,8 +45,7 @@ func Load(path string) (*Config, error) {
 		ZlibPassword:       getEnv("ZLIB_PASSWORD", ""),
 		ZlibLanguages:      parseList(getEnv("ZLIB_LANGUAGES", "")),
 		ZlibOrder:          getEnv("ZLIB_ORDER", "bestmatch"),
-		FormatPreference:   parseList(getEnv("ZLIB_FORMAT_PREFERENCE", "epub,mobi,azw3,pdf")),
-		AbsoluteFormats:    parseList(getEnv("ZLIB_ABSOLUTE_FORMATS", "cbz,cbr")),
+		FormatPreference:   parseList(getEnv("ZLIB_FORMAT_PREFERENCE", "epub,mobi,azw3,pdf,cbz,cbr")),
 		DownloadDir:        getEnv("ZLIB_DOWNLOAD_DIR", "./downloads"),
 		MaxDownloadsPerRun: atoiDefault(getEnv("ZLIB_MAX_DOWNLOADS_PER_RUN", "1"), 1),
 	}

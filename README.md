@@ -20,13 +20,18 @@ Tome e **marca a wish como `fulfilled`**, fechando o ciclo por completo.
 
 1. **Lista** as wishes `open` no Tome.
 2. Para cada wish, **busca** no Z-Library pelo título + autor.
-3. **Escolhe** a melhor correspondência, respeitando a preferência de formato (e formatos
-   absolutos, ex. cbz/cbr para mangás).
+3. **Escolhe** a melhor correspondência, respeitando a preferência de formato
+   (`ZLIB_FORMAT_PREFERENCE`, do melhor para o pior). Apenas um match **plausível**
+   é aceito — um livro claramente não relacionado ao pedido é **recusado**.
 4. **Baixa** o arquivo (se ainda não existir em disco).
 5. **Envia** o arquivo para o Tome (com `book_type_id`).
 6. **Marca** as wishes correspondentes como `fulfilled` via endpoint admin
    (`POST /api/admin/wishlist/{id}/fulfill`), fechando o ciclo.
-7. Repete a cada `POLL_INTERVAL`.
+7. Se o Tome **não associar** o livro enviado à wish, faz uma **segunda chamada** à
+   wishlist: se a wish sumiu, foi fechada; se continua aberta, marca como
+   **dismissed** (recusada) via `POST /api/admin/wishlist/{id}/dismiss` — evitando
+   ciclo infinito.
+8. Repete a cada `POLL_INTERVAL`.
 
 ### Resiliência contra bot checks (DiamWall/Cloudflare)
 
@@ -77,7 +82,8 @@ automatizado. Em vez de burlar essa proteção, o Wishflow faz o mesmo que o plu
    ```
 
    > **Nota**: o token do Tome precisa de **permissão de admin** para marcar as wishes
-   > como `fulfilled`. Sem admin, o upload funciona, mas a etapa final falhará.
+   > como `fulfilled` ou `dismissed`. Sem admin, o upload funciona, mas a etapa final
+   > falhará.
 
 ## Como rodar
 
@@ -135,8 +141,7 @@ ficam persistidos na máquina host durante a execução.
 | `ZLIB_PASSWORD` | sim\* | — | Senha da conta Z-Library |
 | `ZLIB_LANGUAGES` | não | `portuguese,english` | Idiomas da busca |
 | `ZLIB_ORDER` | não | `bestmatch` | Ordenação: `popular`, `bestmatch`, `date`, `titleA`, `title`, `year`, `filesize`, `filesizeA` |
-| `ZLIB_FORMAT_PREFERENCE` | não | `epub,mobi,azw3,pdf` | Ranking de formato, do melhor para o pior |
-| `ZLIB_ABSOLUTE_FORMATS` | não | `cbz,cbr` | Formatos de prioridade absoluta |
+| `ZLIB_FORMAT_PREFERENCE` | não | `epub,mobi,azw3,pdf,cbz,cbr` | Ranking de formato, do melhor para o pior. cbz/cbr ficam no fim e nunca vencem os demais |
 | `ZLIB_DOWNLOAD_DIR` | não | `./downloads` | Diretório temporário dos downloads |
 | `ZLIB_MAX_DOWNLOADS_PER_RUN` | não | `1` | Quantos livros baixar por ciclo |
 
@@ -154,10 +159,16 @@ tome: tipo de livro "wishlist-imported" (id=5)
   #4 [open] O pequeno príncipe (Original) (autor: Antoine de Saint-Exupéry)
 zlib: downloads restantes hoje: 9223372036854775807
 wish #4: buscando "O pequeno príncipe (Original) Antoine de Saint-Exupéry" no zlib...
-wish #4: match "O pequeno príncipe (Original)" (epub)
+wish #4: zlib retornou 12 resultado(s) p/ "O pequeno príncipe (Original) Antoine de Saint-Exupéry"
+wish #4:   [101] "O pequeno príncipe (Original)" (epub, 1.2MB)
+wish #4: match escolhido: "O pequeno príncipe (Original)" (formato=epub, tamanho=1.2MB, idioma=portuguese)
 wish #4: baixado para downloads/O pequeno príncipe Original.epub
 wish #4: upload ok (book id=39) e arquivo local removido
 wish #4: marcada como fulfilled (book id=39) no Tome
+
+# Sem match aceitável: a wish e marcada como recusada para nao ficar em loop
+wish #9: livro RECUSADO - nenhum resultado satisfaz o pedido "Duna e o profeta Herbert"
+wish #9: marcada como dismissed (recusada) no Tome - nao sera processada novamente
 ```
 
 ## Estrutura do projeto

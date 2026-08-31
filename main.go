@@ -164,12 +164,27 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 		log.Printf("wish #%d: livro NAO baixado - erro ao buscar \"%s\" no zlib: %v", w.ID, query, err)
 		return err
 	}
-	best := zlib.SelectBestMatch(books, w.Title, strVal(w.Author), cfg.FormatPreference, cfg.AbsoluteFormats)
-	if best == nil {
-		log.Printf("wish #%d: livro NAO baixado - nao existe no zlib (nenhum resultado para \"%s\")", w.ID, query)
-		return fmt.Errorf("livro nao existe no zlib (nenhum resultado)")
+	log.Printf("wish #%d: zlib retornou %d resultado(s) p/ \"%s\"", w.ID, len(books), query)
+	for i, b := range books {
+		if i >= 5 {
+			break
+		}
+		log.Printf("wish #%d:   [%d] \"%s\" (%s, %s)", w.ID, b.ID, b.DisplayName(), b.Extension, b.Size)
 	}
-	log.Printf("wish #%d: match \"%s\" (%s, %s)", w.ID, best.DisplayName(), best.Extension, best.Size)
+
+	best := zlib.SelectBestMatch(books, w.Title, strVal(w.Author), cfg.FormatPreference)
+	if best == nil {
+		// Nenhum resultado satisfaz o pedido. Em vez de ficar tentando em loop, recusamos
+		// esta wish: marcamos como dismissed para retira-la do fluxo (nao baixamos nada).
+		log.Printf("wish #%d: livro RECUSADO - nenhum resultado satisfaz o pedido \"%s\" (titulo=%q, autor=%q)", w.ID, query, w.Title, strVal(w.Author))
+		if err := tm.DismissWish(w.ID); err != nil {
+			log.Printf("wish #%d: livro recusado, mas falha ao marcar como dismissed no Tome: %v", w.ID, err)
+			return nil
+		}
+		fmt.Printf("wish #%d: marcada como dismissed (recusada) no Tome - nao sera processada novamente\n", w.ID)
+		return nil
+	}
+	log.Printf("wish #%d: match escolhido: \"%s\" (formato=%s, tamanho=%s, idioma=%s)", w.ID, best.DisplayName(), best.Extension, best.Size, best.Language)
 
 	dest := filepath.Join(cfg.DownloadDir, fileName(best))
 	if _, err := os.Stat(dest); os.IsNotExist(err) {
@@ -192,11 +207,11 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 		det, err := tm.UploadFile(dest, bookTypeID)
 		if err == nil {
 			if err := os.Remove(dest); err != nil {
-				log.Printf("wish #%d: upload ok, mas falha ao apagar local: %v", w.ID, err)
+				log.Printf("wish #%d: upload ok (book id=%d), mas falha ao apagar local: %v", w.ID, det.ID, err)
 			} else {
 				log.Printf("wish #%d: upload ok (book id=%d) e arquivo local removido", w.ID, det.ID)
 			}
-			markFulfilled(tm, det)
+			markFulfilled(tm, cfg.WishlistStatus, w, det)
 			return nil
 		}
 		if attempt < cfg.UploadMaxRetries {
@@ -209,20 +224,60 @@ func processWish(cfg *config.Config, tm *tome.Client, zc *zlib.Client, bt *tome.
 	return nil
 }
 
-// markFulfilled fecha o ciclo da wishlist: para cada wish que o livro enviado casou,
-// marca como fulfilled via endpoint admin. O upload já ocorreu; uma falha aqui é apenas
-// registrada e não desfaz o livro enviado.
-func markFulfilled(tm *tome.Client, det *tome.BookDetail) {
-	if len(det.MatchedWishIDs) == 0 {
-		return
-	}
+// markFulfilled fecha o ciclo da wishlist: para cada wish que o livro enviado casou, marca
+// como fulfilled via endpoint admin. O upload ja ocorreu; uma falha aqui e apenas registrada
+// e nao desfaz o livro enviado.
+//
+// Se o Tome nao associou o livro enviado a wish atual (matched_wish_ids sem ela), fazemos uma
+// segunda chamada a wishlist para conferir: se a wish sumiu, foi fechada por outro caminho e
+// terminou; se continua aberta, marcamos como dismissed (recusada) para nao gerar ciclo
+// infinito reprocessando um livro que o Tome nao aceita.
+func markFulfilled(tm *tome.Client, status string, wish tome.Wish, det *tome.BookDetail) {
+	matched := false
 	for _, wishID := range det.MatchedWishIDs {
+		if wishID == wish.ID {
+			matched = true
+		}
 		if err := tm.FulfillWish(wishID, det.ID); err != nil {
 			log.Printf("wish #%d: upload ok (book id=%d), mas falha ao marcar fulfilled: %v", wishID, det.ID, err)
 			continue
 		}
 		fmt.Printf("wish #%d: marcada como fulfilled (book id=%d) no Tome\n", wishID, det.ID)
 	}
+
+	if matched {
+		return
+	}
+
+	// O upload aconteceu mas nao foi associado a esta wish. Re-checamos a wishlist com uma
+	// segunda chamada antes de decidir (a wish pode ter sido fechada por outro caminho).
+	gone := false
+	if open, err := tm.ListWishlist(status); err == nil {
+		found := false
+		for _, ow := range open {
+			if ow.ID == wish.ID {
+				found = true
+				break
+			}
+		}
+		gone = !found
+	} else {
+		log.Printf("wish #%d: upload ok (book id=%d), mas falha ao reverificar wishlist: %v", wish.ID, det.ID, err)
+		return
+	}
+
+	if gone {
+		log.Printf("wish #%d: apos re-checagem a wish sumiu da wishlist (book id=%d) - considerada fechada", wish.ID, det.ID)
+		return
+	}
+
+	log.Printf("wish #%d: ATENCAO - livro enviado (book id=%d) NAO foi associado a esta wish e ela segue aberta. "+
+		"Marcando como dismissed (recusada) para evitar ciclo infinito.", wish.ID, det.ID)
+	if err := tm.DismissWish(wish.ID); err != nil {
+		log.Printf("wish #%d: falha ao marcar como dismissed: %v", wish.ID, err)
+		return
+	}
+	fmt.Printf("wish #%d: marcada como dismissed (recusada) - nao sera processada novamente\n", wish.ID)
 }
 
 func fileName(b *zlib.Book) string {
@@ -252,7 +307,7 @@ func sanitize(s string) string {
 func unionFormats(cfg *config.Config) []string {
 	seen := make(map[string]bool)
 	var out []string
-	for _, f := range append(append([]string{}, cfg.FormatPreference...), cfg.AbsoluteFormats...) {
+	for _, f := range cfg.FormatPreference {
 		if k := strings.ToLower(f); !seen[k] {
 			seen[k] = true
 			out = append(out, k)

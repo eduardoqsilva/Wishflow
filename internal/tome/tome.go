@@ -158,6 +158,28 @@ func (c *Client) FulfillWish(wishID, bookID int) error {
 	return nil
 }
 
+// DismissWish marca uma wish como recusada (status dismissed) via endpoint admin, para
+// retira-la do fluxo de processamento quando nao foi possivel encontrar um livro adequado.
+func (c *Client) DismissWish(wishID int) error {
+	endpoint := fmt.Sprintf("%s/api/admin/wishlist/%d/dismiss", c.baseURL, wishID)
+	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	c.authorize(req)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
 func (c *Client) UploadFile(path string, bookTypeID *int) (*BookDetail, error) {
 	f, err := os.Open(path)
 	if err != nil {
