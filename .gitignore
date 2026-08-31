@@ -1,0 +1,33 @@
+# Environment & secrets
+.env
+
+# Binaries / build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.class
+
+# Go build output
+/dist/
+/bin/
+/build/
+tome-wishlist-downloader
+
+# Downloads (runtime artifacts)
+/downloads/
+
+# Test / coverage
+coverage.txt
+coverage.html
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

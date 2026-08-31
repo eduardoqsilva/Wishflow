@@ -1,0 +1,13 @@
+services:
+  tome-wishlist-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tome-wishlist-downloader
+    env_file:
+      - .env
+    environment:
+      - ZLIB_DOWNLOAD_DIR=/downloads
+    volumes:
+      - ./downloads:/downloads
+    restart: unless-stopped
