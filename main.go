@@ -19,6 +19,27 @@ import (
 // refreshEvery ciclos antes de recarregar o cache do scheduler a partir do SQLite.
 const scheduleRefreshEvery = 10
 
+// circuit breaker: quantos ciclos seguidos com erro 429/5xx antes de pausar longo
+const maxConsecutiveFailures = 3
+// pausa longa quando circuit breaker dispara
+const circuitBreakerPause = 30 * time.Minute
+
+// consecutiveFailures conta ciclos seguidos com erro transitório de API (429/5xx)
+// resetado em sucesso; persistido apenas em memória (ok: reload limpa e recomeça)
+var consecutiveFailures int
+
+// isRetryableAPIError verifica se o erro é um HTTP 429 ou 5xx que vale retry/pausa
+func isRetryableAPIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.HasPrefix(errStr, "HTTP 429") ||
+		strings.HasPrefix(errStr, "HTTP 50") ||
+		strings.HasPrefix(errStr, "HTTP 51") ||
+		strings.HasPrefix(errStr, "HTTP 52")
+}
+
 // wishOutcome descreve o resultado do processamento de uma wish dentro de um ciclo.
 type wishOutcome int
 
@@ -159,7 +180,25 @@ func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.Mi
 	remaining, err := zc.RemainingDownloads()
 	if err != nil {
 		log.Printf("zlib: falha ao ler quota: %v", err)
+		if isRetryableAPIError(err) {
+			consecutiveFailures++
+			log.Printf("circuit breaker: erro transitório detectado (%d/%d ciclos seguidos)", consecutiveFailures, maxConsecutiveFailures)
+			if consecutiveFailures >= maxConsecutiveFailures {
+				until := now.Add(circuitBreakerPause)
+				if serr := sched.SetQuota(cfg.ZlibQuotaLimit, until); serr != nil {
+					log.Printf("zlib: falha ao registrar pausa de circuit breaker: %v", serr)
+				}
+				log.Printf("CIRCUIT BREAKER: %d ciclos seguidos com erro 429/5xx - pausando por %v ate %s",
+					consecutiveFailures, circuitBreakerPause, until.Format("2006-01-02 15:04"))
+				return
+			}
+		}
 	} else {
+		// Sucesso: reseta contador de falhas consecutivas
+		if consecutiveFailures > 0 {
+			log.Printf("circuit breaker: quota lida com sucesso - resetando contador de falhas (%d -> 0)", consecutiveFailures)
+			consecutiveFailures = 0
+		}
 		fmt.Printf("zlib: downloads restantes hoje: %d\n", remaining)
 		if remaining <= 0 {
 			// Quota esgotada confirmada pelo profile: pausa o processamento por um ciclo
@@ -174,6 +213,7 @@ func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.Mi
 	}
 
 	processed := 0
+	hadRetryableError := false
 	for _, w := range wishes {
 		// Pula wish que esta agendada e ainda nao venceu (monitoramento em curso).
 		if due, ok := sched.ScheduledUntil(w.ID); ok && due.After(now) {
@@ -221,8 +261,32 @@ func runOnce(cfg *config.Config, tm *tome.Client, zc *zlib.Client, pool *zlib.Mi
 		case wishFailed:
 			if out.err != nil {
 				log.Printf("wish #%d (%s): %v", w.ID, w.Title, out.err)
+				if isRetryableAPIError(out.err) {
+					hadRetryableError = true
+				}
 			}
 			// Nao conta como processada: o erro e transitorio, tenta de novo no ciclo.
+		}
+	}
+
+	// Circuit breaker: se teve erros retryable mas nenhum sucesso neste ciclo, incrementa contador
+	if hadRetryableError && processed == 0 {
+		consecutiveFailures++
+		log.Printf("circuit breaker: ciclo com erros 429/5xx e sem sucessos (%d/%d ciclos seguidos)", consecutiveFailures, maxConsecutiveFailures)
+		if consecutiveFailures >= maxConsecutiveFailures {
+			until := now.Add(circuitBreakerPause)
+			if serr := sched.SetQuota(cfg.ZlibQuotaLimit, until); serr != nil {
+				log.Printf("zlib: falha ao registrar pausa de circuit breaker: %v", serr)
+			}
+			log.Printf("CIRCUIT BREAKER: %d ciclos seguidos com erro 429/5xx e sem progresso - pausando por %v ate %s",
+				consecutiveFailures, circuitBreakerPause, until.Format("2006-01-02 15:04"))
+			return
+		}
+	} else if processed > 0 {
+		// Teve sucesso: reseta contador
+		if consecutiveFailures > 0 {
+			log.Printf("circuit breaker: ciclo com sucessos - resetando contador de falhas (%d -> 0)", consecutiveFailures)
+			consecutiveFailures = 0
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -18,6 +19,49 @@ import (
 )
 
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"
+
+// isRetryableStatus reports whether an HTTP status code is worth retrying
+// (transient server errors or rate limiting).
+func isRetryableStatus(status int) bool {
+	return status == 429 || status >= 500 && status < 600
+}
+
+// doWithRetry executes fn with exponential backoff for transient errors.
+// It retries on network errors and retryable HTTP status codes (429, 5xx).
+// maxAttempts includes the initial attempt (default 3).
+func doWithRetry(fn func() (int, []byte, error), maxAttempts int) (int, []byte, error) {
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		status, body, err := fn()
+		if err != nil {
+			lastErr = err
+			// Network error - retry
+			if attempt < maxAttempts {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				// Add jitter: +/- 25%
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return 0, nil, err
+		}
+		if isRetryableStatus(status) {
+			lastErr = fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(string(body)))
+			if attempt < maxAttempts {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return status, body, lastErr
+		}
+		return status, body, nil
+	}
+	return 0, nil, lastErr
+}
 
 // ErrNoDownload indica que um livro especifico nao possui link de download disponivel
 // (resposta sem downloadLink ou success falso). Diferente de erros transitorios (rede,
@@ -143,26 +187,44 @@ func (c *Client) Login() error {
 	form.Set("email", c.email)
 	form.Set("password", c.password)
 
-	status, body, err := c.postForm(c.currentBase()+"/eapi/user/login", form)
-	if err != nil {
-		return err
-	}
-	if looksLikeBotChallenge([]byte(body)) {
-		return &BotChallengeError{Base: c.currentBase()}
-	}
-	var lr loginResponse
-	if err := json.Unmarshal([]byte(body), &lr); err != nil {
-		if status != http.StatusOK {
-			return fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(body))
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		status, body, err := c.postForm(c.currentBase()+"/eapi/user/login", form)
+		if err != nil {
+			lastErr = err
+			if attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return err
 		}
-		return err
+		if looksLikeBotChallenge([]byte(body)) {
+			return &BotChallengeError{Base: c.currentBase()}
+		}
+		if status != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(body))
+			if isRetryableStatus(status) && attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return lastErr
+		}
+		var lr loginResponse
+		if err := json.Unmarshal([]byte(body), &lr); err != nil {
+			return err
+		}
+		if !loginSuccess(lr.Success) || lr.User.ID == 0 || lr.User.RemixUserKey == "" {
+			return fmt.Errorf("credenciais rejeitadas ou resposta invalida: HTTP %d %s", status, strings.TrimSpace(body))
+		}
+		c.userID = fmt.Sprintf("%d", lr.User.ID)
+		c.userKey = lr.User.RemixUserKey
+		return nil
 	}
-	if !loginSuccess(lr.Success) || lr.User.ID == 0 || lr.User.RemixUserKey == "" {
-		return fmt.Errorf("credenciais rejeitadas ou resposta invalida: HTTP %d %s", status, strings.TrimSpace(body))
-	}
-	c.userID = fmt.Sprintf("%d", lr.User.ID)
-	c.userKey = lr.User.RemixUserKey
-	return nil
+	return lastErr
 }
 
 type searchResponse struct {
@@ -197,24 +259,42 @@ func (c *Client) SearchLanguages(query string, languages []string) ([]Book, erro
 		form.Set("order", c.order)
 	}
 
-	status, body, err := c.postForm(c.currentBase()+"/eapi/book/search", form)
-	if err != nil {
-		return nil, err
-	}
-	if status != http.StatusOK {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		status, body, err := c.postForm(c.currentBase()+"/eapi/book/search", form)
+		if err != nil {
+			lastErr = err
+			if attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return nil, err
+		}
 		if looksLikeBotChallenge([]byte(body)) {
 			return nil, &BotChallengeError{Base: c.currentBase()}
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(body))
+		if status != http.StatusOK {
+			lastErr = fmt.Errorf("HTTP %d: %s", status, strings.TrimSpace(body))
+			if isRetryableStatus(status) && attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return nil, lastErr
+		}
+		var sr searchResponse
+		if err := json.Unmarshal([]byte(body), &sr); err != nil {
+			return nil, err
+		}
+		if len(sr.Books) > 0 {
+			return sr.Books, nil
+		}
+		return sr.ExactMatch.Books, nil
 	}
-	var sr searchResponse
-	if err := json.Unmarshal([]byte(body), &sr); err != nil {
-		return nil, err
-	}
-	if len(sr.Books) > 0 {
-		return sr.Books, nil
-	}
-	return sr.ExactMatch.Books, nil
+	return nil, lastErr
 }
 
 type profileResponse struct {
@@ -226,98 +306,138 @@ type profileResponse struct {
 }
 
 func (c *Client) RemainingDownloads() (int, error) {
-	req, err := http.NewRequest(http.MethodGet, c.currentBase()+"/eapi/user/profile", nil)
-	if err != nil {
-		return 0, err
-	}
-	c.setHeaders(req)
+	return c.remainingDownloadsWithRetry(3)
+}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		if looksLikeBotChallenge(body) {
-			return 0, &BotChallengeError{Base: c.currentBase()}
+// remainingDownloadsWithRetry fetches the profile with retry logic for transient errors.
+func (c *Client) remainingDownloadsWithRetry(maxAttempts int) (int, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodGet, c.currentBase()+"/eapi/user/profile", nil)
+		if err != nil {
+			return 0, err
 		}
-		return 0, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		c.setHeaders(req)
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < maxAttempts {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return 0, err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			if looksLikeBotChallenge(body) {
+				return 0, &BotChallengeError{Base: c.currentBase()}
+			}
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			if isRetryableStatus(resp.StatusCode) && attempt < maxAttempts {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return 0, lastErr
+		}
+		var pr profileResponse
+		if err := json.Unmarshal(body, &pr); err != nil {
+			return 0, err
+		}
+		if !loginSuccess(pr.Success) {
+			return 0, fmt.Errorf("profile falhou: %s", strings.TrimSpace(string(body)))
+		}
+		if pr.User.Limit <= 0 {
+			return int(^uint(0) >> 1), nil
+		}
+		rem := pr.User.Limit - pr.User.DownloadsToday
+		if rem < 0 {
+			rem = 0
+		}
+		return rem, nil
 	}
-	var pr profileResponse
-	if err := json.Unmarshal(body, &pr); err != nil {
-		return 0, err
-	}
-	if !loginSuccess(pr.Success) {
-		return 0, fmt.Errorf("profile falhou: %s", strings.TrimSpace(string(body)))
-	}
-	if pr.User.Limit <= 0 {
-		return int(^uint(0) >> 1), nil
-	}
-	rem := pr.User.Limit - pr.User.DownloadsToday
-	if rem < 0 {
-		rem = 0
-	}
-	return rem, nil
+	return 0, lastErr
 }
 
 func (c *Client) GetDownloadLink(id int, hash string) (string, error) {
 	endpoint := fmt.Sprintf("%s/eapi/book/%d/%s/file", c.currentBase(), id, hash)
 	log.Printf("zlib: GetDownloadLink id=%d - API: %s | library: %s/book/%d/%s", id, endpoint, c.currentBase(), id, hash)
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-	if err != nil {
-		return "", err
-	}
-	c.setHeaders(req)
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	ct := resp.Header.Get("Content-Type")
-	log.Printf("zlib: GetDownloadLink id=%d - HTTP %d, content-type=%q", id, resp.StatusCode, ct)
-	if resp.StatusCode != http.StatusOK {
-		if looksLikeBotChallenge(body) {
-			log.Printf("zlib: GetDownloadLink id=%d - BOT CHECK (resposta nao-JSON)", id)
-			return "", &BotChallengeError{Base: c.currentBase()}
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return "", err
 		}
-		log.Printf("zlib: GetDownloadLink id=%d - corpo: %s", id, strings.TrimSpace(string(body)))
-		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		c.setHeaders(req)
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return "", err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		ct := resp.Header.Get("Content-Type")
+		log.Printf("zlib: GetDownloadLink id=%d - HTTP %d, content-type=%q (attempt %d/3)", id, resp.StatusCode, ct, attempt)
+
+		if resp.StatusCode != http.StatusOK {
+			if looksLikeBotChallenge(body) {
+				log.Printf("zlib: GetDownloadLink id=%d - BOT CHECK (resposta nao-JSON)", id)
+				return "", &BotChallengeError{Base: c.currentBase()}
+			}
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+			if isRetryableStatus(resp.StatusCode) && attempt < 3 {
+				backoff := time.Duration(attempt*attempt) * time.Second
+				jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+				time.Sleep(backoff + jitter)
+				continue
+			}
+			return "", lastErr
+		}
+		if htmlResponse(ct) {
+			log.Printf("zlib: GetDownloadLink id=%d - QUOTA/HTML: %s", id, strings.TrimSpace(string(body)))
+			return "", fmt.Errorf("quota de downloads diaria esgotada (resposta HTML)")
+		}
+		var data struct {
+			Success json.RawMessage `json:"success"`
+			File    struct {
+				DownloadLink  string `json:"downloadLink"`
+				AllowDownload *bool  `json:"allowDownload"`
+			} `json:"file"`
+		}
+		if err := json.Unmarshal(body, &data); err != nil {
+			log.Printf("zlib: GetDownloadLink id=%d - JSON invalido: %s", id, strings.TrimSpace(string(body)))
+			return "", err
+		}
+		if !loginSuccess(data.Success) {
+			log.Printf("zlib: GetDownloadLink id=%d - success=falso, corpo: %s", id, strings.TrimSpace(string(body)))
+			return "", fmt.Errorf("API erro ao obter link: %s", strings.TrimSpace(string(body)))
+		}
+		if data.File.AllowDownload != nil && !*data.File.AllowDownload {
+			log.Printf("zlib: GetDownloadLink id=%d - QUOTA: allowDownload=false (limite diario atingido)", id)
+			return "", ErrQuota
+		}
+		if data.File.DownloadLink == "" {
+			log.Printf("zlib: GetDownloadLink id=%d - sucesso porem downloadLink VAZIO (sem download). corpo: %s", id, strings.TrimSpace(string(body)))
+			return "", ErrNoDownload
+		}
+		log.Printf("zlib: GetDownloadLink id=%d - TEM downloadLink", id)
+		return data.File.DownloadLink, nil
 	}
-	if htmlResponse(ct) {
-		log.Printf("zlib: GetDownloadLink id=%d - QUOTA/HTML: %s", id, strings.TrimSpace(string(body)))
-		return "", fmt.Errorf("quota de downloads diaria esgotada (resposta HTML)")
-	}
-	var data struct {
-		Success json.RawMessage `json:"success"`
-		File    struct {
-			DownloadLink  string `json:"downloadLink"`
-			AllowDownload *bool  `json:"allowDownload"`
-		} `json:"file"`
-	}
-	if err := json.Unmarshal(body, &data); err != nil {
-		log.Printf("zlib: GetDownloadLink id=%d - JSON invalido: %s", id, strings.TrimSpace(string(body)))
-		return "", err
-	}
-	if !loginSuccess(data.Success) {
-		log.Printf("zlib: GetDownloadLink id=%d - success=falso, corpo: %s", id, strings.TrimSpace(string(body)))
-		return "", fmt.Errorf("API erro ao obter link: %s", strings.TrimSpace(string(body)))
-	}
-	// A API devolve success=1 mas allowDownload=false + disallowDownloadMessage quando a
-	// conta atingiu o limite diario. Isso nao e "livro sem link": afeta todos os livros e
-	// so acaba no reset diario, entao tratamos como quota (transitorio).
-	if data.File.AllowDownload != nil && !*data.File.AllowDownload {
-		log.Printf("zlib: GetDownloadLink id=%d - QUOTA: allowDownload=false (limite diario atingido)", id)
-		return "", ErrQuota
-	}
-	if data.File.DownloadLink == "" {
-		log.Printf("zlib: GetDownloadLink id=%d - sucesso porem downloadLink VAZIO (sem download). corpo: %s", id, strings.TrimSpace(string(body)))
-		return "", ErrNoDownload
-	}
-	log.Printf("zlib: GetDownloadLink id=%d - TEM downloadLink", id)
-	return data.File.DownloadLink, nil
+	return "", lastErr
 }
 
 func (c *Client) Download(link, dest string) error {
